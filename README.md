@@ -1,7 +1,5 @@
 # RGMF: Reliable Guideline-Driven Multi-modal Fusion Model for Healthcare Analytics*
 
----
-
 ## Overview
 
 Multimodal Electronic Health Records (EHRs), combining multivariate physiological time series and free-text clinical notes, offer rich signals for clinical outcome prediction. However, existing deep learning methods predominantly capture surface statistical correlations without grounding representations in evidence-based clinical standards, which limits their reliability in safety-critical settings. These black-box models also lack interpretability, making it difficult for clinicians to trace decision logic.
