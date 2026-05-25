@@ -2,7 +2,7 @@
 
 <div align="center">
 
-**RGMF: Reliable Guideline-Driven Multi-modal Fusion Model for Healthcare Analytics**
+*RGMF: Reliable Guideline-Driven Multi-modal Fusion Model for Healthcare Analytics*
 
 </div>
 
