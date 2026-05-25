@@ -1,0 +1,297 @@
+'''
+This is the script to run TS experiments on MIMIC-III dataset.
+'''
+
+from argparse import ArgumentParser
+from datetime import datetime
+import pandas as pd
+import ipdb
+import wandb
+
+import torch
+from lightning import Trainer, seed_everything
+from lightning.pytorch.callbacks import LearningRateMonitor, ModelCheckpoint, EarlyStopping
+from lightning.pytorch.loggers import WandbLogger
+import os
+import sys
+import os
+os.environ["WANDB_MODE"] = "offline"  # 完全禁用上传
+os.environ["CUDA_VISIBLE_DEVICES"] = "3"
+
+CURRENT_DIR = os.path.dirname(os.path.abspath(__file__))
+# 项目根目录
+ROOT_DIR = os.path.abspath(os.path.join(CURRENT_DIR, '../..'))
+# 关键：将 src 目录加入路径（cmehr 在 src 下）
+SRC_DIR = os.path.join(ROOT_DIR, 'src')
+sys.path.insert(0, SRC_DIR)
+# 验证路径是否正确
+print("ROOT_DIR:", ROOT_DIR)          # 应输出 /home/df/RGMF
+print("SRC_DIR:", SRC_DIR)            # 应输出 /home/df/RGMF/src
+print("cmehr 路径存在:", os.path.exists(os.path.join(SRC_DIR, 'cmehr')))  # 应输出 True
+
+from cmehr.dataset import MIMIC3DataModule
+from cmehr.models.mimic4 import (
+    CNNModule, ProtoTSModel, IPNetModule, GRUDModule, SEFTModule,
+    MTANDModule, DGM2OModule, MedFuseModule, UTDEModule, LSTMModule)
+from cmehr.models.mimic3.rgmf_model import RGMFModule
+from cmehr.paths import *
+
+torch.backends.cudnn.deterministic = True  # type: ignore
+torch.backends.cudnn.benchmark = True  # type: ignore
+torch.set_float32_matmul_precision("high")
+
+parser = ArgumentParser(description="PyTorch Lightning EHR Model")
+parser.add_argument("--task", type=str, default="pheno",
+                    choices=["ihm", "decomp", "los", "pheno", "readm"])
+parser.add_argument("--batch_size", type=int, default=128)
+parser.add_argument("--num_workers", type=int, default=4)
+parser.add_argument("--update_counts", type=int, default=3)
+parser.add_argument("--max_epochs", type=int, default=50)
+parser.add_argument("--update_encoder_epochs", type=int, default=2)
+parser.add_argument("--devices", type=int, default=1)
+parser.add_argument("--max_length", type=int, default=1024)
+parser.add_argument("--accumulate_grad_batches", type=int, default=1)
+parser.add_argument("--first_nrows", type=int, default=-1)
+parser.add_argument("--model_name", type=str, default="rgmf",
+                    choices=["proto_ts", "ipnet", "grud", "seft", "mtand", "dgm2",
+                             "medfuse", "cnn", "utde", "rgmf", "lstm"])
+parser.add_argument("--ts_learning_rate", type=float, default=4e-5)
+parser.add_argument("--ckpt_path", type=str,
+                    default="")
+parser.add_argument("--test_only", action="store_true")
+parser.add_argument("--pooling_type", type=str, default="mean",
+                    choices=["attention", "mean", "last"])
+parser.add_argument("--use_prototype", action="store_true")
+parser.add_argument("--use_multiscale", action="store_true")
+parser.add_argument("--lamb1", type=float, default=0.5)
+parser.add_argument("--lamb2", type=float, default=0)
+parser.add_argument("--lamb3", type=float, default=0)
+parser.add_argument("--lamb4", type=float, default=0.05)
+parser.add_argument("--num_slots", type=int, default=16)
+
+args = parser.parse_args()
+
+'''
+CUDA_VISIBLE_DEVICES=3 python train_mimic3.py --devices 1 --task ihm --batch_size 128 --model_name utde 
+CUDA_VISIBLE_DEVICES=4 python train_mimic3.py --devices 1 --task pheno --batch_size 128 --model_name utde 
+'''
+
+args.orig_reg_d_ts = 34
+args.orig_d_ts = 17
+
+
+def cli_main():
+    all_auroc = []
+    all_auprc = []
+    all_f1 = []
+
+    for seed in [42]:
+        seed_everything(seed)
+
+        # define datamodule
+        if args.first_nrows == -1:
+            args.first_nrows = None
+
+        if args.task in ["ihm", "readm"]:
+            args.period_length = 48
+            args.num_labels = 2
+        elif args.task == "pheno":
+            args.period_length = 24
+            args.num_labels = 25
+
+        dm = MIMIC3DataModule(
+            file_path=str(
+                DATA_PATH / f"output_mimic3/{args.task}"),
+            tt_max=args.period_length,
+            batch_size=args.batch_size,
+            modeltype="TS_Text",
+            num_workers=args.num_workers,
+            first_nrows=args.first_nrows)
+
+        # define model
+        if args.test_only:
+            args.devices = 1
+
+        if args.model_name == "ipnet":
+            if args.ckpt_path:
+                model = IPNetModule.load_from_checkpoint(
+                    args.ckpt_path, **vars(args))
+            else:
+                model = IPNetModule(**vars(args))
+        elif args.model_name == "proto_ts":
+            if args.ckpt_path:
+                model = ProtoTSModel.load_from_checkpoint(
+                    args.ckpt_path, **vars(args))
+            else:
+                model = ProtoTSModel(**vars(args))
+        elif args.model_name == "grud":
+            if args.ckpt_path:
+                model = GRUDModule.load_from_checkpoint(
+                    args.ckpt_path, **vars(args))
+            else:
+                model = GRUDModule(**vars(args))
+        elif args.model_name == "seft":
+            if args.ckpt_path:
+                model = SEFTModule.load_from_checkpoint(
+                    args.ckpt_path, **vars(args))
+            else:
+                model = SEFTModule(**vars(args))
+        elif args.model_name == "mtand":
+            if args.ckpt_path:
+                model = MTANDModule.load_from_checkpoint(
+                    args.ckpt_path, **vars(args))
+            else:
+                model = MTANDModule(**vars(args))
+        elif args.model_name == "dgm2":
+            if args.ckpt_path:
+                model = DGM2OModule.load_from_checkpoint(
+                    args.ckpt_path, **vars(args))
+            else:
+                model = DGM2OModule(**vars(args))
+        elif args.model_name == "medfuse":
+            if args.ckpt_path:
+                model = MedFuseModule.load_from_checkpoint(
+                    args.ckpt_path, **vars(args))
+            else:
+                model = MedFuseModule(**vars(args))
+        elif args.model_name == "cnn":
+            if args.ckpt_path:
+                model = CNNModule.load_from_checkpoint(
+                    args.ckpt_path, **vars(args))
+            else:
+                model = CNNModule(**vars(args))
+        elif args.model_name == "lstm":
+            if args.ckpt_path:
+                model = LSTMModule.load_from_checkpoint(
+                    args.ckpt_path, **vars(args))
+            else:
+                model = LSTMModule(**vars(args))
+        elif args.model_name == "utde":
+            if args.ckpt_path:
+                model = UTDEModule.load_from_checkpoint(
+                    args.ckpt_path, **vars(args))
+            else:
+                model = UTDEModule(**vars(args))
+        elif args.model_name == "rgmf":
+            if args.ckpt_path:
+                model = RGMFModule.load_from_checkpoint(
+                    args.ckpt_path, **vars(args))
+            else:
+                model = RGMFModule(
+                    task=args.task,
+                    orig_d_ts=args.orig_d_ts,
+                    orig_reg_d_ts=args.orig_reg_d_ts,
+                    warmup_epochs=20,
+                    max_epochs=args.max_epochs,
+                    ts_learning_rate=args.ts_learning_rate,
+                    embed_time=64,
+                    embed_dim=128,
+                    num_of_notes=4,
+                    period_length=args.period_length,
+                    num_slots=args.num_slots,
+                    lamb1=args.lamb1,
+                    lamb2=args.lamb2,
+                    lamb3=args.lamb3,
+                    lamb4=args.lamb4,
+                    use_prototype=args.use_prototype,
+                    use_multiscale=args.use_multiscale,
+                    bert_type="/home/df/bert-tiny",
+                    TS_mixup=True,
+                    mixup_level="batch",
+                    dropout=0.1,
+                    pooling_type=args.pooling_type,
+                    freeze_pretrained=False,  # 不冻结，直接训练全部参数
+                    freeze_after_epochs=999,
+                    # 方案 B: 可训练记忆队列参数
+                    use_trainable_memory=args.use_trainable_memory,
+                    memory_queue_size=args.memory_queue_size,
+                    memory_top_k=args.memory_top_k,
+                    # SOD: 槽正交初始化参数
+                    use_sod=args.use_sod_init,
+                )
+
+            # 方案 B: 打印记忆队列信息
+            if args.use_trainable_memory:
+                print(f"[方案 B] 启用可训练记忆队列，队列大小: {args.memory_queue_size}，Top-K: {args.memory_top_k}")
+
+            # SOD: 打印信息
+            if args.use_sod_init:
+                print(f"[SOD] 启用正交初始化（仅用于初始化，不影响训练动态）")
+        else:
+            raise ValueError("Invalid model name")
+
+        model.train_iters_per_epoch = len(dm.train_dataloader()) // (args.accumulate_grad_batches * args.devices)
+
+        # initialize trainer
+        run_name = datetime.now().strftime("%Y-%m-%d_%H-%M-%S")
+        run_name = f"mimic3_{args.task}_{args.model_name}_{run_name}"
+        os.makedirs(ROOT_PATH / "log/ckpts", exist_ok=True)
+        logger = WandbLogger(
+            name=run_name,
+            save_dir=str(ROOT_PATH / "log"),
+            project="RGMF", log_model=False)
+        if args.task in ["ihm", "readm"]:
+            callbacks = [
+                LearningRateMonitor(logging_interval="step"),
+                ModelCheckpoint(
+                    dirpath=str(ROOT_PATH / "log/ckpts" / run_name),
+                    monitor="val_auprc",
+                    mode="max",
+                    save_top_k=2,
+                    save_last=False),
+                EarlyStopping(monitor="val_auprc", patience=5,
+                              mode="max", verbose=True)
+            ]
+        elif args.task == "pheno":
+            callbacks = [
+                LearningRateMonitor(logging_interval="step"),
+                ModelCheckpoint(
+                    dirpath=str(ROOT_PATH / "log/ckpts" / run_name),
+                    monitor="val_auroc",
+                    mode="max",
+                    save_top_k=2,
+                    save_last=False),
+                EarlyStopping(monitor="val_auroc", patience=5,
+                              mode="max", verbose=True)
+            ]
+
+        trainer = Trainer(
+            devices=args.devices,
+            accelerator="gpu",
+            max_epochs=args.max_epochs,
+            precision="16-mixed",
+            accumulate_grad_batches=args.accumulate_grad_batches,
+            # deterministic=False,
+            callbacks=callbacks,
+            logger=logger,
+            strategy="ddp_find_unused_parameters_true",
+            gradient_clip_val=0.5,
+        )
+
+        if not args.test_only:
+            trainer.fit(model, dm)
+            trainer.test(model, datamodule=dm, ckpt_path="best")
+        else:
+            trainer.test(model, datamodule=dm)
+
+        all_auroc.append(model.report_auroc)
+        all_auprc.append(model.report_auprc)
+        all_f1.append(model.report_f1)
+
+        wandb.finish()
+
+    report_df = pd.DataFrame({
+        "auroc": all_auroc,
+        "auprc": all_auprc,
+        "f1": all_f1
+    })
+
+    mean_df = report_df.mean(axis=0)
+    std_df = report_df.std(axis=0)
+    statistic_df = pd.concat([mean_df, std_df], axis=1)
+    statistic_df.columns = ["mean", "std"]
+    print(statistic_df)
+
+
+if __name__ == "__main__":
+    cli_main()
